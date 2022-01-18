@@ -1,0 +1,287 @@
+#!/bin/bash
+
+# This function is an adaptation of that by 
+# Scott Wales 20190522
+# Modified by
+# Josué Martinez-Moreno to run in datarmor 20220114
+
+print_help() {
+cat <<EOF
+
+Run a Jupyter notebook on datarmor's compute nodes, presenting the interface 
+in a browser on the local machine
+
+You can set a default username in your local ~/.ssh/config, e.g.
+
+    Host datarmor
+    User abc123
+
+General Options:
+    -h:         Print help
+    -l USER:    datarmor username
+    -L HOST:    datarmor login node (default 'datarmor')
+    -e ENVIRON: Conda environment
+    -d:         Debug mode
+
+Queue Options:
+    -q QUEUE:   Queue name
+    -n NCPU:    Use NCPU cpus
+    -g NGPU:    Use NGPU gpus (only on some queues)
+    -m MEM:     Memory allocation (default 4*NCPU GB)
+    -t TIME:    Walltime limit (default 1 hour)
+
+EOF
+}
+
+set -eu
+
+# Internal defaults
+USER=''
+PROJECT=''
+LOGINNODE='datarmor'
+QUEUE='omp'
+NCPUS='2'
+NGPUS=''
+WALLTIME=1:00:00
+MEM=''
+CONDA_ENV=base
+DEBUG=""
+
+# Handle arguments
+optspec="hl:L:q:n:m:t:J:P:e:ds:g:"
+while getopts "$optspec" optchar; do
+    case "${optchar}" in
+        h)
+            print_help
+            exit 2
+            ;;
+        l)
+            USER="${OPTARG}"
+            ;;
+        L)
+            LOGINNODE="${OPTARG}"
+            ;;
+        q)
+            QUEUE="${OPTARG}"
+            ;;
+        n)
+            NCPUS="${OPTARG}"
+            ;;
+        g)
+            NGPUS="${OPTARG}"
+            ;;
+        t)
+            WALLTIME="${OPTARG}"
+            ;;
+        m)
+            MEM="${OPTARG}"
+            ;;
+        e)
+            CONDA_ENV="${OPTARG}"
+            ;;
+        d)
+            DEBUG=true
+            ;;
+        *)
+            print_help
+            exit 2
+            ;;
+    esac
+done
+
+# This gets evaluated on datarmor in the SSH script
+WORKDIR=/home1/scratch/\$USER/tmp/runjp
+
+# Check for agent
+set +e
+ssh-add -l &> /dev/null
+AGENT=$?
+set -e
+if [ $AGENT -eq 2 ]; then
+    # Restart with an agent
+    ssh-agent "$0" "$@"
+    exit
+fi
+if [ $AGENT -eq 1 ]; then
+    # No keys saved
+    ssh-add
+fi
+
+SSH='ssh -x -oBatchMode=yes'
+SCP='scp -B -q'
+if [ -n "$USER" ]; then
+    SSH="${SSH} -l ${USER}"
+fi
+
+if [ $NCPUS -gt 28 ]; then
+    echo "WARNING: Using more than one node with Dask needs extra setup and is not supported by this script"
+fi
+if [ $NCPUS -gt 8 ]; then
+    echo "WARNING: Using a large number of CPUs in an interactive session can waste lots of NCI compute time. Try keeping the number of CPUs under 8."
+    read -p "Proceed? [y/N] " -n 1 cpu_confirm
+    echo
+    if [[ ! "$cpu_confirm" =~ ^[Yy]$ ]]; then
+        exit
+    fi
+fi
+if [ -z "$MEM" ]; then
+    MEM_PER_CPU=1
+
+
+    MEM="$(( NCPUS * MEM_PER_CPU ))gb"
+fi
+
+SUBMITOPTS="-N jupyter-lab -q '$QUEUE' -l 'ncpus=${NCPUS},mem=${MEM},walltime=${WALLTIME}'"
+
+if [ -n "$NGPUS" ]; then
+    SUBMITOPTS="$SUBMITOPTS -l 'ngpus=$NGPUS'"
+fi
+
+echo "Starting notebook on ${LOGINNODE}..."
+if [ -n "$DEBUG" ]; then
+    echo "DEBUG: Connecting using: '$SSH $LOGINNODE'"
+fi
+
+# Check connection
+$SSH "$LOGINNODE" true
+
+echo "qsub ${SUBMITOPTS}"
+
+# Kill the job if this top-level script is cancelled while the job is still in the queue
+trap "{ echo 'Stopping queued job... (Ctrl-C will leave job in the queue)' ; $SSH \"$LOGINNODE\" > /dev/null <<< 'qdel \$(cat $WORKDIR/jobid)' ; }" EXIT
+
+message=$(
+$SSH -q "$LOGINNODE" <<EOF | tail -n 1
+
+set -eu
+
+WORKDIR="$WORKDIR"
+mkdir -p "\$WORKDIR"
+
+# Check if already running
+if [ -f "\$WORKDIR/jobid" ] && [ "\$(qstat -x \$(cat "\$WORKDIR/jobid") | sed -n '\$s/\S\+\s\+jupyter-lab\s.*\s[QR]\s\+\S\+\s*$/\0/p')" ] ; then
+    while [ ! -f "\$WORKDIR/message" ]; do
+        sleep 5
+    done
+    cat "\$WORKDIR/message" | sed 's/$/ RECONNECT/'
+    exit
+fi
+
+rm -f "\$WORKDIR/message"
+
+cat > "\$WORKDIR/runjp.sh" <<EOQ
+#!/bin/bash
+
+module purge
+
+eval "\\\$(/appli/anaconda/versions/4.8.3/bin/conda shell.bash hook)"
+conda activate "${CONDA_ENV}"
+
+set -eu
+
+# Jupyter security token
+TOKEN=\\\$(uuidgen)
+
+# Find a remote port https://unix.stackexchange.com/a/132524
+PORT=\\\$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+
+# Write message file with info for the local connection
+echo "\\\$HOSTNAME \\\$TOKEN \\\$PBS_JOBID \\\$PORT" > "\$WORKDIR/message"
+
+echo "runjp log dir \$WORKDIR"
+cat "\$WORKDIR/message"
+
+export DASK_LABEXTENSION__FACTORY__MODULE=dask.distributed
+export DASK_LABEXTENSION__FACTORY__CLASS=LocalCluster
+export DASK_LABEXTENSION__FACTORY__KWARGS__MEMORY_LIMIT=3900MB
+export DASK_LABEXTENSION__DEFAULT__WORKERS=\\\$NCPUS
+export DASK_DISTRIBUTED__DASHBOARD__LINK="/proxy/{port}/status"
+
+jupyter notebook --NotebookApp.token="\\\$TOKEN" --no-browser --ip="\\\$HOSTNAME" --port "\\\$PORT" --port-retries=0
+EOQ
+
+qsub $SUBMITOPTS -W umask=0022 -j oe -o "\$WORKDIR/pbs.log" "\$WORKDIR/runjp.sh" > "\$WORKDIR/jobid"
+
+# Wait for the message file to appear, then return to the local process
+while [ ! -f "\$WORKDIR/message" ]; do
+    sleep 5
+done
+cat "\$WORKDIR/message" | sed 's/$/ NEW/'
+EOF
+)
+
+if [ -n "$DEBUG" ]; then
+    echo "DEBUG: Remote Message: '$message'"
+fi
+
+# Grab info from the PBS job
+read jobhost token jobid remote_port type <<< "$message"
+
+if [ "$type" = "ERROR" ]; then
+    echo
+    echo "Stopping due to error"
+    exit
+fi
+if [ "$type" = "RECONNECT" ]; then
+    echo
+    echo "Existing jupyterlab found, reconnecting to that instead"
+fi
+
+# Find a local port
+for local_port in {8888..9000}; do
+    if ! echo > /dev/tcp/127.0.0.1/${local_port} ; then
+        break
+    fi 2> /dev/null
+done
+
+echo
+echo "Notebook running as PBS job ${jobid}"
+echo
+echo "Starting tunnel..."
+if [ -n "$DEBUG" ]; then
+    echo "DEBUG:" $SSH -N -L "${local_port}:$jobhost:${remote_port}" "$LOGINNODE"
+fi
+$SSH -N -L "${local_port}:$jobhost:${remote_port}" "$LOGINNODE" &
+tunnelid=$!
+
+# Shut everything down on exit
+trap "{ echo 'Closing connections... (Ctrl-C will leave job in the queue)' ; kill $tunnelid ; $SSH "$LOGINNODE" qdel $jobid ; }" EXIT
+
+# Wait for startup then open a browser
+sleep 5
+URL="http://localhost:${local_port}/lab?token=${token}"
+
+cat << EOF
+Opening ${URL}
+EOF
+
+set +e
+if [ -f "/mnt/c/Windows/system32/cmd.exe" ]; then
+    # Windows subsystem for linux
+    /mnt/c/Windows/system32/cmd.exe /c start "$URL"
+elif which xdg-open > /dev/null; then
+    # Linux
+    xdg-open "$URL"
+elif which open > /dev/null; then
+    # OSX
+    open "$URL"
+elif which explorer > /dev/null; then
+    # Windows
+    explorer "$URL"
+else
+    echo
+    echo "----"
+    echo "Can't find a way to open the URL automatically, please copy the URL above into your browser"
+fi
+set -e
+echo
+
+# Copy monitory files.
+$SCP ./qmonitor ./qtools.py $USER@$LOGINNODE:$WORKDIR
+
+$SSH "$LOGINNODE" $WORKDIR/qmonitor $jobid
+
+# Move the cursor past the progress bars
+echo
+echo
+echo
